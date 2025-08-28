@@ -106,7 +106,24 @@ function parseDaysToken(daysRaw) {
     return out.map((tok) => DAY_MAP[tok] || DAY_MAP[tok[0]]).filter(Boolean);
 }
 
-// ===== MP parsing from "MWF | 12:05 PM - 12:55 PM | Room ..." =====
+// Map BYDAY to JS weekday (0=Sun..6=Sat)
+const BYDAY_TO_JS = {SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6};
+
+// First date on/after 'startDate' that matches a target weekday
+function firstOnOrAfter(startDate, weekday0Sun) {
+    const d = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
+    const delta = (weekday0Sun - d.getDay() + 7) % 7;
+    d.setDate(d.getDate() + delta);
+    return d;
+}
+
+// Number of weekly occurrences between [first, endDate] inclusive for a single weekday
+function weeklyCount(first, endDate) {
+    if (first > endDate) return 0;
+    const ms = endDate - first;
+    return Math.floor(ms / (7 * 24 * 3600 * 1000)) + 1;
+}
+
 function splitChunks(text) {
     return text
         .split(/\n|;|•|·|\s*\|\s*/g)
@@ -183,35 +200,69 @@ function parseMeetingPattern(raw) {
     return {days, startTime, endTime, location: s(location), startDate, endDate};
 }
 
-function expandOccurrences(mp, courseTitle) {
+// Build recurring events (one VEVENT per weekday) with RRULE:FREQ=WEEKLY;BYDAY=..;COUNT=..
+function expandToRecurringEvents(mp, courseTitle) {
     const out = [];
     if (!mp.days.length || !mp.startTime || !mp.endTime) return out;
 
+    // Default dates if MP didn't include them (same behavior you had)
     const startDate =
         mp.startDate ||
         (() => {
             const d = new Date();
-            return nextWeekdayOnOrAfter(d, 1);
+            // next Monday fallback
+            const monday = 1;
+            const first = firstOnOrAfter(d, monday);
+            return first;
         })();
     const endDate =
         mp.endDate ||
         (() => {
             const d = new Date(startDate);
-            d.setDate(d.getDate() + 7 * 16);
+            d.setDate(d.getDate() + 7 * 16); // ~16 weeks fallback
             return d;
         })();
 
     for (const byday of mp.days) {
-        const weekday0Sun = {SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6}[byday];
+        const weekday0Sun = BYDAY_TO_JS[byday];
         if (weekday0Sun == null) continue;
-        let cur = nextWeekdayOnOrAfter(startDate, weekday0Sun);
-        while (cur <= endDate) {
-            const st = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate(), mp.startTime.h, mp.startTime.m, 0, 0);
-            const en = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate(), mp.endTime.h, mp.endTime.m, 0, 0);
-            if (en <= st) en.setMinutes(en.getMinutes() + 50);
-            out.push({title: courseTitle, location: mp.location, start: st, end: en});
-            cur.setDate(cur.getDate() + 7);
-        }
+
+        // First class date for this weekday
+        const firstDate = firstOnOrAfter(startDate, weekday0Sun);
+
+        // Compose DTSTART/DTEND on that first date
+        const dtStart = new Date(
+            firstDate.getFullYear(),
+            firstDate.getMonth(),
+            firstDate.getDate(),
+            mp.startTime.h,
+            mp.startTime.m,
+            0,
+            0
+        );
+        const dtEnd = new Date(
+            firstDate.getFullYear(),
+            firstDate.getMonth(),
+            firstDate.getDate(),
+            mp.endTime.h,
+            mp.endTime.m,
+            0,
+            0
+        );
+        if (dtEnd <= dtStart) dtEnd.setMinutes(dtEnd.getMinutes() + 50);
+
+        // COUNT of weekly meetings (inclusive) for this weekday
+        const count = weeklyCount(firstDate, endDate);
+        if (count <= 0) continue;
+
+        out.push({
+            title: courseTitle,
+            location: mp.location || '',
+            byday, // e.g., "MO"
+            count, // integer
+            dtstart: dtStart,
+            dtend: dtEnd
+        });
     }
     return out;
 }
@@ -304,25 +355,33 @@ function getStartEndDatesFromRow(row) {
 }
 
 // ===== Build ICS =====
-function toICS(events) {
+function toICS(recurringEvents) {
     const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'CALSCALE:GREGORIAN', 'PRODID:-//ISU Workday Export//EN'];
     const stamp = dtstampNowUTC();
-    events.forEach((ev, i) => {
-        const uid = `isu-workday-${i}-${ev.start.getTime()}@isu`;
+
+    for (const [i, ev] of recurringEvents.entries()) {
+        const uid = `isu-workday-rrule-${i}-${ev.dtstart.getTime()}@isu`;
+        const dtStartLocal = `${yyyymmdd(ev.dtstart)}T${hhmmss(ev.dtstart)}`;
+        const dtEndLocal = `${yyyymmdd(ev.dtend)}T${hhmmss(ev.dtend)}`;
+        const rrule = `RRULE:FREQ=WEEKLY;BYDAY=${ev.byday};COUNT=${ev.count}`;
+
         lines.push(
             'BEGIN:VEVENT',
             `UID:${uid}`,
             `DTSTAMP:${stamp}`,
             `SUMMARY:${icsEscape(ev.title)}`,
-            `LOCATION:${icsEscape(ev.location || '')}`,
-            `DTSTART;TZID=${TZ}:${yyyymmdd(ev.start)}T${hhmmss(ev.start)}`,
-            `DTEND;TZID=${TZ}:${yyyymmdd(ev.end)}T${hhmmss(ev.end)}`,
+            `LOCATION:${icsEscape(ev.location)}`,
+            `DTSTART;TZID=${TZ}:${dtStartLocal}`,
+            `DTEND;TZID=${TZ}:${dtEndLocal}`,
+            rrule,
             'END:VEVENT'
         );
-    });
+    }
+
     lines.push('END:VCALENDAR');
     return lines.join('\r\n');
 }
+
 function downloadICS(filename, icsText) {
     const blob = new Blob([icsText], {type: 'text/calendar;charset=utf-8'});
     const url = URL.createObjectURL(blob);
@@ -373,7 +432,7 @@ function scrapeCourses() {
             if (!mp.startDate && startDate) mp.startDate = startDate;
             if (!mp.endDate && endDate) mp.endDate = endDate;
 
-            const evs = expandOccurrences(mp, courseTitle);
+            const evs = expandToRecurringEvents(mp, courseTitle);
             if (evs.length) events.push(...evs);
         }
     }
@@ -383,7 +442,7 @@ function scrapeCourses() {
 
 function runExport() {
     const events = scrapeCourses();
-    console.info('[ISU Export] Parsed events:', events.length);
+    //console.info('[ISU Export] Parsed events:', events.length);
     if (!events.length) {
         alert('No class meetings found to export. Make sure the table is visible and expanded.');
         return;
@@ -404,7 +463,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             runExport();
             sendResponse({ok: true});
         } catch (e) {
-            console.error(e);
+            //console.error(e);
             alert(e?.message || 'Export failed.');
             sendResponse({ok: false, error: e?.message});
         }
