@@ -1,0 +1,19 @@
+{
+    "manifest_version": 3,
+    "name": "ISU Workday → .ics Exporter",
+    "version": "1.0.0",
+    "description": "Scrape 'My Enrolled Courses' on Workday and export a .ics calendar of your classes.",
+    "permissions": ["activeTab", "scripting", "downloads"],
+    "host_permissions": ["https://www.myworkday.com/*", "https://*.myworkday.com/*"],
+    "action": {
+        "default_title": "Export .ics",
+        "default_popup": "popup.html"
+    },
+    "content_scripts": [
+        {
+            "matches": ["https://www.myworkday.com/*", "https://*.myworkday.com/*"],
+            "js": ["content.js"],
+            "run_at": "document_idle"
+        }
+    ]
+}
